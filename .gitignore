@@ -1,0 +1,56 @@
+# Ignore Gradle project-specific cache directory
+.gradle
+
+# Ignore Gradle build output directory
+build
+/.claude/*
+!/.claude/rules/
+!/.claude/rules/**
+/.idea
+/app/bin
+# Environment variables（含密钥，绝不入库）
+.env
+.env.*
+!.env.example
+test-output.txt
+
+# 密钥与证书
+*.pem
+*.key
+*.p12
+secrets/
+*.jks
+app/src/main/resources/application-local.yml
+app/src/main/resources/application-secret.yml
+# IDEA code analysis
+qodana.yaml
+
+app/src/main/resources/application-dev.yml
+SETUP_API_KEYS.md
+
+# Maven/Gradle 构建产物
+target/
+out/
+*.class
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+
+# 运行期产物与日志
+*.log
+logs/
+.DS_Store
+Thumbs.db
+
+# AI Assistant documentation（本地辅助文件，不入库）
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+GEMINI.md
+
+# Playwright MCP
+.playwright-mcp/
+frontend/test-results/
+frontend/playwright-report/
+/.agents
+skills-lock.json
