@@ -35,7 +35,7 @@ public class McpMailService {
     /** 发送结果。 */
     public record SendResult(boolean delivered, String messageId, String errorMessage) {
 
-        static SendResult failed(String message) {
+        public static SendResult failed(String message) {
             return new SendResult(false, null, message);
         }
     }
