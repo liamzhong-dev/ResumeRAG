@@ -11,6 +11,7 @@
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-pgvector-336791?logo=postgresql)](https://www.postgresql.org/)
 [![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-black)](https://modelcontextprotocol.io/)
 [![License](https://img.shields.io/badge/License-MIT-blue)](./LICENSE)
+[![CI](https://github.com/liamzhong-dev/ResumeRAG/actions/workflows/ci.yml/badge.svg)](https://github.com/liamzhong-dev/ResumeRAG/actions/workflows/ci.yml)
 
 **仓库**：<https://github.com/liamzhong-dev/ResumeRAG>
 
