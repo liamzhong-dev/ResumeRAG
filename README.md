@@ -69,16 +69,16 @@
 
 ---
 
-## 六项核心工作
+## 具体做了什么
 
 ### 1. Tika 多格式简历解析与噪声清洗
 
-**思路**：简历正文的质量直接决定后面 LLM 评分和 RAG 的效果，而 Tika 的默认行为会把大量非正文内容带进来。这里做了两层处理：
+简历正文的质量直接决定后面 LLM 评分和 RAG 的效果，而 Tika 的默认行为会把大量非正文内容带进来。这里做了两层：
 
 - **解析层**：`AutoDetectParser` + `BodyContentHandler`（5MB 上限）只取正文；通过 `ParseContext` 注入 `NoOpEmbeddedDocumentExtractor` 禁用嵌入资源提取；`PDFParserConfig` 关闭 `extractInlineImages` 并开启 `sortByPosition` 修复多栏 PDF 的阅读顺序。
 - **清洗层**：解析结果再过一遍语义级去噪，去掉图片文件名行、图片 URL、`file:` 协议临时路径、符号分隔线、控制字符，然后统一换行与空行。
 
-**关键代码**：
+改动主要落在这几个文件：
 
 | 文件 | 作用 |
 | --- | --- |
@@ -87,22 +87,22 @@
 | `infrastructure/file/TextCleaningService.java` | `cleanText()`：5 类预编译正则 + 格式规范化（第 80–105 行） |
 | `infrastructure/file/DocumentParseConfiguration.java` | 解析专用有界线程池（默认 2 线程 / 队列 20 / 2 分钟超时） |
 
-**为什么要禁用图片提取**：Tika 默认会把 PDF 内嵌图片交给 `EmbeddedDocumentExtractor` 处理，输出里混入 `image1.png`、`file:/tmp/apache-tika-xxx` 之类的噪声行。这些字符串进到 LLM prompt 里既污染上下文又白烧 token，在 RAG 场景还会被当成正文向量化。
+顺带记一笔，为什么要专门禁用图片提取：Tika 默认会把 PDF 内嵌图片交给 `EmbeddedDocumentExtractor`，输出里于是混进 `image1.png`、`file:/tmp/apache-tika-xxx` 这类噪声行。这些字符串进 LLM prompt 既污染上下文又白烧 token，在 RAG 场景里更麻烦 —— 会被当成正文一起向量化。
 
-**结果**：PDF / DOCX / DOC / TXT 四类格式的解析输出中不再出现图片文件名行与临时文件路径；解析走独立有界线程池，单份文件超时 2 分钟即失败，不会拖垮业务线程池。
+改完之后，PDF / DOCX / DOC / TXT 四类格式的解析输出中不再出现图片文件名行与临时文件路径；解析走独立的有界线程池，单份文件超时 2 分钟即失败，不会拖垮业务线程池。
 
 ---
 
 ### 2. Redis Stream 异步解耦长耗时任务
 
-**思路**：简历分析、知识库向量化、面试评估、知识库出题这四类任务都要调 LLM，单次调用是**秒到十几秒**量级。同步阻塞接口会把这个耗时直接暴露给用户，且请求堆积时线程池会被打满。统一改成：
+简历分析、知识库向量化、面试评估、知识库出题这四类任务都要调 LLM，单次调用是**秒到十几秒**量级。同步阻塞接口等于把这个耗时直接甩给用户，请求一堆积线程池就满了。所以统一改成：
 
 - 接口侧只做「落库 + 投递 Stream」，立刻返回任务状态；
 - 消费者侧串行消费，用 `AbstractStreamProducer` / `AbstractStreamConsumer` 两个模板类收敛发送、ACK、重试、失败兜底的骨架；
 - **条件领取 + 代次 fencing**：`PENDING → PROCESSING` 用带 `attemptId` 的条件更新做原子领取，多实例部署时只有领取成功的消费者执行任务；心跳与终态写入都必须匹配同一 `attemptId`；
-- **恢复调度器**：定时扫描超过阈值的 `PENDING` / `PROCESSING` 任务补投，避免消息丢失后任务永久卡住。
+- **恢复调度器**：定时扫描超过阈值的 `PENDING` / `PROCESSING` 任务补投，避免消息丢了以后任务永久卡住。
 
-**关键代码**：
+涉及的文件：
 
 | 文件 | 作用 |
 | --- | --- |
@@ -112,20 +112,20 @@
 | `modules/resume/listener/ResumeAnalysisRecoveryScheduler.java` | 卡住任务恢复调度 |
 | `resources/db/migration/V20260905__task_recovery_fields.sql`、`V20260906__task_attempt_fencing.sql` | 恢复字段与代次围栏 |
 
-**结果**：瓶颈定位有实测依据——同一套链路上 LLM 生成阶段 P50 18.7s / P95 29.9s（见文末性能表）。同步模型下接口响应时间就是这个量级；改成异步后接口只做入库与投递，响应时间降到 ~200ms 量级，接口侧吞吐相应提升约 **70 倍**（单实例本地自测，复现方式见「数据口径说明」）。
+这么改的收益是有实测支撑的 —— 同一套链路上 LLM 生成阶段 P50 18.7s / P95 29.9s（见文末性能表），同步模型下接口响应时间就是这个量级；改成异步后接口只做入库与投递，降到 ~200ms 量级，接口侧吞吐相应提升约 **70 倍**（单实例本地自测，复现方式见「数据口径说明」）。
 
 ---
 
 ### 3. pgvector + 智能分块 + 1024 维向量 + HNSW 索引
 
-**思路**：知识库问答的底座。四个决策点：
+知识库问答的底座，四个决策点值得单独说：
 
 1. **向量库选型**：PG 自带向量能力就够用，不额外引入专用向量数据库，少一个运维组件。
 2. **schema 交给 Flyway**：`spring.ai.vectorstore.pgvector.initialize-schema=false`，避免应用启动时绕过迁移改表结构。扩展与索引在 `V20260723` 里用幂等 DDL 建：`vector(1024)` + `USING hnsw (embedding vector_cosine_ops)`，`dimensions=1024`、`distance-type=COSINE_DISTANCE` 与 `text-embedding-v3` 对齐。
 3. **智能分块**：`TokenTextSplitter`，目标 800 token、单块最小 350 字符、按中英文句末标点（`。？！；\n`）优先切分、保留分隔符；低于 5 字符的碎片不参与 Embedding。分块参数全部外置为配置，并写入向量 metadata 的 `chunk_strategy` 便于排查混用。
-4. **写入的原子性**：向量化先写 `pending:{kbId}:{jobId}` 的临时 `kb_id`，全部批次成功后由 `promoteVectorJob` 一次性切换为正式 `kb_id`，失败按 `jobId` 清理——避免重新向量化过程中旧数据已删、新数据没写完导致知识库"空窗"。
+4. **写入的原子性**：向量化先写 `pending:{kbId}:{jobId}` 的临时 `kb_id`，全部批次成功后由 `promoteVectorJob` 一次性切换为正式 `kb_id`，失败按 `jobId` 清理 —— 否则重新向量化时会撞上旧数据已删、新数据还没写完的"空窗"。
 
-**关键代码**：
+对应文件：
 
 | 文件 | 作用 |
 | --- | --- |
@@ -133,20 +133,20 @@
 | `modules/knowledgebase/service/KnowledgeBaseVectorService.java` | 分块 → 分批 Embedding（批大小 10，对齐 DashScope 限制）→ 临时 kb_id → promote |
 | `modules/knowledgebase/service/KnowledgeBaseVectorProperties.java` | 分块参数与校验（第 26–107 行） |
 
-**结果**：40 条样本、2 篇文档共 44 个 chunk 的测评集上，向量检索 P50 **161ms** / P95 **207ms**（真实实测，报告见 `app/src/test/resources/rag-eval/baselines/`）。分块大小的 ablation 结论见下一节。
+在 40 条样本、2 篇文档共 44 个 chunk 的测评集上，向量检索 P50 **161ms** / P95 **207ms**（真实实测，报告见 `app/src/test/resources/rag-eval/baselines/`）。分块大小的 ablation 放在下一节。
 
 ---
 
 ### 4. Query Rewrite 与动态 TopK / minScore 自适应
 
-**思路**：固定 TopK 和阈值的检索策略在长短 Query 上表现是矛盾的——短 Query（"G1 停顿？"）语义稀疏，需要放宽召回；长 Query 自带足够信息，TopK 给大了只会引入弱相关噪声。做法是：
+固定 TopK 和阈值的检索策略，在长短 Query 上的表现是矛盾的 —— 短 Query（"G1 停顿？"）语义稀疏，需要放宽召回；长 Query 自带足够信息，TopK 给大了只会引入弱相关噪声。做法是：
 
 - **按 Query 长度分档**（`resolveSearchParams`）：去空白后 ≤4 字 → TopK 20 / minScore 0.18；≤12 字 → TopK 12 / 0.28；更长 → TopK 8 / 0.28。
 - **Query Rewrite**：用 LLM 结合最近 10 条历史把口语化、指代不清的问题改写成完整检索 Query；改写失败、返回空、或与原句相同都自动降级回原始 Query，不影响可用性。
 - **候选串串行降级 + 可选双路融合**：先检索改写 Query，无命中再退原始 Query；`mergeOriginalQuery` 打开时两路各检索一次，按 Document ID 去重取高分、稳定排序后融合。
 - **全程埋点**：改写/检索/生成三段耗时与命中数走 `RagMetrics`，改写失败原因（disabled/blank/unchanged/error）单独计数。
 
-**关键代码**：
+这几个方法值得单独点出来看：
 
 | 文件 | 作用 |
 | --- | --- |
@@ -183,20 +183,20 @@
 
 小块 MRR 更好（定位更准）、大块召回更好（上下文更完整），默认取 800 作为折中。
 
-> ⚠️ **必须说明的置信度问题**：同一配置（chunkSize=800、关闭改写）两次独立 run 的 Hit@K 分别是 96.88% 和 87.50%，差 9 个百分点。40 条样本下 Hit@K 的置信区间很宽，上表结论应作为**方向性判断**而非精确定量。拿更硬的结论需要扩样本集，已列入后续规划。
+置信度这件事得先说清楚：同一配置（chunkSize=800、关闭改写）两次独立 run 的 Hit@K 分别是 96.88% 和 87.50%，差 9 个百分点。40 条样本下 Hit@K 的置信区间很宽，上表结论应作为**方向性判断**而非精确定量。想要更硬的结论得扩样本集，已列入后续规划。
 
 ---
 
 ### 5. MCP 集成企业邮件服务 + 双评分 ≥90 自动通知
 
-**思路**：候选人筛选的最后一环是"通知 HR"，这一步要解决的不是"怎么发邮件"，而是**什么时候该发**、以及**不能重复发、不能丢**。
+候选人筛选的最后一环是"通知 HR"。这一步真正要解决的不在"怎么发邮件"，而在**什么时候该发**，以及**不能重复发、不能丢**。
 
 - **MCP 层**：自己实现了 MCP 客户端（`initialize` / `tools/list` / `tools/call`，JSON-RPC 2.0 over Streamable HTTP）。业务侧只见 `McpMailService.send(to, subject, text)`，换邮件服务商只需换 MCP Server 和工具名，Java 侧零改动——这是引入 MCP 协议而不是直接写 SMTP 的原因。
 - **双评分判定**：只看 LLM 评分不够。同一份简历重复分析，LLM 可能给出 88 和 93 两个结果，单点阈值会让通知边界抖动。所以加了第二路**规则评分**（确定性函数，可复现）：技能关键词命中率 / 工作年限 / 学历 / 项目密度 / 结构完整度五维加权。**两路同时 ≥90 才发**。
 - **幂等与可靠投递**：`(biz_type, biz_id)` 唯一索引做数据库兜底，建单时若已 `SENT` 直接跳过；失败按 2s / 4s 退避重投，最多 3 次；投递结果落 `notification_tasks` 表并打 `app.notification.delivery` 指标。
 - **旁路隔离**：通知挂在简历分析消费者之后，异常吞掉只记日志，不影响分析主流程的完成态。
 
-**关键代码**：
+这一块是新增的，代码集中在：
 
 | 文件 | 作用 |
 | --- | --- |
@@ -220,13 +220,13 @@ APP_NOTIFICATION_MIN_RESUME_SCORE=90
 APP_NOTIFICATION_MIN_RULE_SCORE=90
 ```
 
-**结果**：双评分口径下通知边界稳定（规则分是确定性函数，不受模型抖动影响）；投递结果全部可观测（`notification_tasks.status` + `app_notification_delivery_total{result=sent|failed}`）；送达率数据见文末性能表。
+最后落到两个效果：双评分口径下通知边界是稳定的（规则分是确定性函数，不吃模型抖动）；投递结果全部可观测（`notification_tasks.status` + `app_notification_delivery_total{result=sent|failed}`）。送达率数据见文末性能表。
 
 ---
 
 ### 6. Skill 标签驱动个性化模拟面试
 
-**思路**：模拟面试的质量取决于"考什么、按什么比例考、用什么标准评"。把这部分从代码里抽出去，做成可配置的 Skill 资源：
+模拟面试的质量取决于"考什么、按什么比例考、用什么标准评"。这三件事本来写死在代码里，这里把它们抽出去做成可配置的 Skill 资源：
 
 - 每个面试方向一个目录：`SKILL.md`（YAML front matter 定义 persona）+ `skill.meta.yml`（分类清单：key / label / priority / ref / shared）。
 - 启动时扫描 `classpath:skills/*/SKILL.md` 建注册表，并构建全局 `category → reference` 索引；`_shared/references` 下 20 篇共享知识（Java、Spring、MySQL、Redis、MQ、分布式、系统设计、算法等）供各方向复用。
@@ -234,7 +234,7 @@ APP_NOTIFICATION_MIN_RULE_SCORE=90
 - **JD 解析生成自定义 Skill**：粘贴 JD 由 LLM 提取考察方向，模型返回的 `ref` 会用本地 `categoryRefIndex` 纠正（防止模型编造不存在的参考文件），并对路径做白名单校验防目录穿越。
 - **字符预算**：references 注入按场景分级——出题 12000 字符、评估 6000 字符、单文件 3000 字符，超出截断并标注，避免撑爆上下文。
 
-**关键代码**：
+入口在：
 
 | 文件 | 作用 |
 | --- | --- |
@@ -423,7 +423,7 @@ RUN_RAG_EVAL=true REDIS_DATABASE=1 ./gradlew :app:ragEvaluation     # RAG 测评
 | [Smart-interview](https://github.com/jianglonghui/smart-interview-system) 一类 | Node.js/Express + SQLite/Redis，或纯前端 Vite + React | 题库管理、出题、面试记录 | 以**题库 CRUD + 出题**为主，用 SQLite、无向量检索，缺乏检索质量度量与评估闭环；本项目用 pgvector + Skill 配额 + 统一评估引擎覆盖这部分 |
 | [VORTEX AI](https://devpost.com/software/ai-interviewer-simulator)（AI Interviewer Simulator） | 浏览器端 + LLM API + Prompt Engineering | 高压技术面模拟、实时追问与反馈 | 黑客松演示性质，**无后端持久化与工程化设施**；本项目有完整的 schema 迁移、异步任务、幂等投递与指标埋点 |
 
-**一句话差异**：同类项目多在验证"LLM 能不能干这件事"，本项目多回答了一层——"干这件事的系统怎么做到可观测、可复现、可运维"。具体体现在：40 条标注样本的 RAG 测评 harness 与 6 份 ablation 报告、Redis Stream 的条件领取与代次围栏、Flyway 版本化的向量表 schema、通知的幂等建单与退避重投。
+跟上面几个放在一起看，差别的层次不太一样：同类项目多在验证"LLM 能不能干这件事"，这里想多回答一层 —— "干这件事的系统怎么做到可观测、可复现、可运维"。落到具体东西上就是：40 条标注样本的 RAG 测评 harness 与 6 份 ablation 报告、Redis Stream 的条件领取与代次围栏、Flyway 版本化的向量表 schema、通知的幂等建单与退避重投。
 
 ---
 
